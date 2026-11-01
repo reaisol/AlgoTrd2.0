@@ -1,23 +1,38 @@
-"""Bounded monthly historical backfill entrypoint.
-
-October execution deliberately stops after its one requested month; it never
-chains into a year-long job.
-"""
+"""Checkpointed, single-month backfill orchestrator."""
 from __future__ import annotations
-import argparse, json, shutil
+import argparse,json,shutil
 from datetime import date
 from pathlib import Path
 from .calendar import KNOWN_HOLIDAYS
 from .monthly_inventory import expected_weekdays
-
+from .config import Settings
+from .providers.groww import GrowwClient
+from .collectors.historical import HistoricalCollector
+from .storage.manifest import Manifest
+STAGES=('PREFLIGHT','CASH','DISCOVERY','INVENTORY','OPTIONS','VALIDATION','MAPPING','RELEASE','QLIB','NAUTILUS','COMPLETE')
 MIN_FREE_GB=8
+def state_path(root,month):return root/'generated/phase5b'/f'{month}-state.json'
 def main(argv=None):
  p=argparse.ArgumentParser();p.add_argument('--month',required=True);p.add_argument('--dry-run',action='store_true');a=p.parse_args(argv)
- year,month=map(int,a.month.split('-')); root=Path('data'); free=shutil.disk_usage(root).free/1024**3
- if free<MIN_FREE_GB: raise SystemExit(f'insufficient free space: {free:.2f} GB')
+ try:y,m=map(int,a.month.split('-'));assert 1<=m<=12
+ except Exception:raise SystemExit('--month must be YYYY-MM')
+ root=Path('data');root.joinpath('generated/phase5b').mkdir(parents=True,exist_ok=True);free=shutil.disk_usage(root).free/2**30
+ if free<MIN_FREE_GB:raise SystemExit(f'insufficient free space: {free:.2f} GB')
  import calendar
- sessions=expected_weekdays(date(year,month,1),date(year,month,calendar.monthrange(year,month)[1]),KNOWN_HOLIDAYS)
- report={'month':a.month,'sessions_expected':len(sessions),'free_gb_before':free,'status':'DRY_RUN' if a.dry_run else 'NOT_IMPLEMENTED','safeguard':'no multi-month continuation'}
- (root/'generated/phase5b').mkdir(parents=True,exist_ok=True);(root/'generated/phase5b'/f'{a.month}-report.json').write_text(json.dumps(report,indent=2)+'\n');print(json.dumps(report))
- if not a.dry_run: raise SystemExit('October collection adapter requires verified calendar/provider normalization wiring before live execution')
+ sessions=expected_weekdays(date(y,m,1),date(y,m,calendar.monthrange(y,m)[1]),KNOWN_HOLIDAYS)
+ path=state_path(root,a.month);state=json.loads(path.read_text()) if path.exists() else {'month':a.month,'completed':[]}
+ report={'month':a.month,'sessions_expected':len(sessions),'free_gb':free,'state_machine':STAGES,'completed':state['completed'],'dry_run':a.dry_run}
+ if 'PREFLIGHT' not in state['completed']:state['completed'].append('PREFLIGHT')
+ path.write_text(json.dumps(state,indent=2)+'\n')
+ print(json.dumps(report))
+ if a.dry_run:return
+ # CASH is deliberately bounded to this month; durable manifest rows make a
+ # repeated invocation skip checksum-recorded windows.
+ if 'CASH' not in state['completed']:
+  client=GrowwClient(Settings()); manifest=Manifest(root/'manifests/ingestion.sqlite3')
+  try: cash=HistoricalCollector(client,root,manifest).download(date(y,m,1),date(y,m,calendar.monthrange(y,m)[1]))
+  finally: client.close();manifest.close()
+  if cash['invalid']:raise SystemExit(f'cash validation failed: {cash}')
+  state['cash']=cash;state['completed'].append('CASH');path.write_text(json.dumps(state,indent=2)+'\n')
+ raise SystemExit('CASH complete; DISCOVERY/INVENTORY/OPTIONS require the month-independent contract registry adapter')
 if __name__=='__main__':main()
