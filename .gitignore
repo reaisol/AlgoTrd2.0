@@ -1,0 +1,10 @@
+.env
+secrets.txt
+.venv/
+.venv-*/
+venv/
+__pycache__/
+.DS_Store
+.pytest_cache/
+*.log
+/data/
